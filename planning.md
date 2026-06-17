@@ -123,6 +123,62 @@ No additional tools are required for this implementation. The agent uses only:
 
 ---
 
+## Stretch Feature: Retry Logic with Fallback
+
+### What it does
+When `search_listings` returns no results, the agent automatically retries with progressively looser constraints instead of immediately failing. It informs the user exactly what filter was removed, so they understand why the results changed.
+
+### Retry sequence (implemented in `run_agent()` in `agent.py`)
+
+**Retry 1 — drop size filter:**
+```python
+if not results and size is not None:
+    results = search_listings(description, None, max_price)
+    if results:
+        session["retry_note"] = f"No results for size {size} — showing results without size filter."
+        size = None
+```
+
+**Retry 2 — drop price filter too:**
+```python
+if not results and max_price is not None:
+    results = search_listings(description, None, None)
+    if results:
+        session["retry_note"] = "No exact matches — removed size and price filters to find results."
+        size = None
+        max_price = None
+```
+
+**All retries exhausted:**
+```python
+if not results:
+    session["error"] = f"No results found for {filter_str} — even after removing size and price filters. Try a different description."
+    return session
+```
+
+### State additions
+A new `retry_note` field is added to the session dict:
+```python
+"retry_note": None  # set to a string if any retry was triggered; None otherwise
+```
+
+If `retry_note` is set, `handle_query()` in `app.py` prepends it to the listing panel output so the user sees which filter was removed.
+
+### Design decisions
+- Size is dropped before price because size is more restrictive in the dataset — many users want a specific price range but are flexible on size.
+- The original parsed values (`session["parsed"]["size"]`, `session["parsed"]["max_price"]`) are never modified — they preserve the user's original intent for display in the UI.
+- Only the local variables `size` and `max_price` are updated during retries so downstream tools use the relaxed values.
+- The retry is transparent: the note always tells the user what changed, not just that results were found.
+
+### Error handling for this feature
+| Condition | Agent response |
+|-----------|---------------|
+| Retry 1 finds results | Sets `retry_note`, continues pipeline normally |
+| Retry 2 finds results | Sets `retry_note`, continues pipeline normally |
+| All retries fail | Sets `session["error"]` naming which filters were tried, returns early |
+
+---
+
 ## Planning Loop
 
 **How does your agent decide which tool to call next?**
@@ -175,18 +231,31 @@ Call:
 results = search_listings(description, size, max_price)
 ```
 
-### Step 3 — Handle search results
-
+### Step 3 — Handle search results (with retry fallback)
+BEFORE STRETCH GOAL:
 IF results is `empty`:
 
 return error message to user
 STOP execution immediately
+AFTER IMPLEMENT STRETCH GOAL:
+IF results is `empty` AND size was specified:
+- Retry: call `search_listings(description, None, max_price)` (drop size filter)
+- If results found: store `retry_note` in session, set `size = None`, continue
 
-ELSE (results exist):
+IF still empty AND max_price was specified:
+- Retry: call `search_listings(description, None, None)` (drop price filter too)
+- If results found: store `retry_note` in session, continue
+
+IF still empty after all retries:
+- Set `session["error"]` naming which filters were tried
+- STOP execution immediately
+
+ELSE (results exist, either from initial search or a retry):
 
 set `selected_item = results[0]`
 Always store:
-- last_search_results = results
+- search_results = results
+- retry_note = message describing what was loosened (or None if no retry needed)
 
 ### Step 4 — Generate outfit
 
@@ -227,7 +296,8 @@ state = {
     "fit_card": None,
     "wardrobe": {"items": []},
     "last_search_results": [],
-    "last_query": None
+    "last_query": None,
+    "retry_note": None,   # set if search was retried with looser constraints
 }
 ```
 
@@ -268,7 +338,9 @@ Each tool includes explicit failure handling to prevent silent failures and ensu
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query |Return a user message explaining no items were found and stop the workflow immediately |
+| search_listings | No results — size filter too restrictive | Retry without size filter; set `retry_note` in session to inform user |
+| search_listings | No results — price filter too restrictive | Retry without size and price filters; set `retry_note` in session |
+| search_listings | No results after all retries | Return error message naming which filters were tried; stop workflow immediately |
 | suggest_outfit | Wardrobe is empty (`wardrobe["items"] == []`)| Generate a fallback outfit using only the selected item without wardrobe matching |
 | create_fit_card | Outfit input is missing or incomplete | Generate a fallback caption using only the selected item |
 
@@ -276,8 +348,9 @@ Each tool includes explicit failure handling to prevent silent failures and ensu
 
 - The agent must never crash or return `None`
 - The agent must always return a user-facing message, even in failure cases
-- If `search_listings` fails, no further tools are executed
+- If `search_listings` fails after all retries, no further tools are executed
 - All fallback behavior must still produce a usable output for the user
+- Retry attempts are transparent — the user always sees which filter was relaxed
 ---
 
 ## Architecture
@@ -306,7 +379,8 @@ FitFindr has four layers: a Gradio UI (`app.py`), a planning loop (`agent.py`), 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  Planning Loop — run_agent() in agent.py                                    │
 │  Session state: { query, parsed, search_results, selected_item,             │
-│                   wardrobe, outfit_suggestion, fit_card, error }            │
+│                   wardrobe, outfit_suggestion, fit_card, error,             │
+│                   retry_note }                                              │
 │                                                                             │
 │  Step 1 — Regex parse query                                                 │
 │      description (str), size (str|None), max_price (float|None)             │
@@ -317,12 +391,18 @@ FitFindr has four layers: a Gradio UI (`app.py`), a planning loop (`agent.py`), 
 │      ▼                                                                      │
 │  search_listings(description, size, max_price)        ┌─────────────────┐  │
 │      │                                                │  Session State  │  │
-│      │ results == []                                  │                 │  │
-│      ├──► [ERROR] "No listings found…" ─► return ◄───┤  search_results │  │
-│      │           session early (tools 2 & 3 skipped)  │  selected_item  │  │
-│      │                                                │  outfit_suggest │  │
-│      │ results = [item, ...]                          │  fit_card       │  │
-│      ▼                                                │  error          │  │
+│      │ results == [] AND size set                     │                 │  │
+│      ├──► Retry 1: search_listings(desc, None, price) │  search_results │  │
+│      │       │ results found → set retry_note         │  selected_item  │  │
+│      │       │ results == [] AND max_price set        │  outfit_suggest │  │
+│      │       └──► Retry 2: search_listings(desc,None,None)  fit_card   │  │
+│      │               │ results found → set retry_note │  error          │  │
+│      │               │ results == [] (all retries done)│  retry_note    │  │
+│      │               └──► [ERROR] "No results after   │                 │  │
+│      │                    retries" ─► return early ◄──┤                 │  │
+│      │                                                │                 │  │
+│      │ results = [item, ...]                          │                 │  │
+│      ▼                                                │                 │  │
 │  Session: selected_item = results[0]  ────────────────►                 │  │
 │      │                                                └─────────────────┘  │
 │      ▼                                                                      │
@@ -376,7 +456,9 @@ FitFindr has four layers: a Gradio UI (`app.py`), a planning loop (`agent.py`), 
 | Where | Condition | Outcome |
 |-------|-----------|---------|
 | `handle_query` | empty query string | return error in panel 1, skip agent |
-| `search_listings` | returns `[]` | set `session["error"]`, return session immediately — tools 2 & 3 never called |
+| `search_listings` | returns `[]`, size was set | Retry without size filter; set `retry_note` if found |
+| `search_listings` | still `[]`, max_price was set | Retry without size or price filter; set `retry_note` if found |
+| `search_listings` | still `[]` after all retries | set `session["error"]`, return session immediately — tools 2 & 3 never called |
 | `suggest_outfit` | `wardrobe["items"] == []` | LLM generates item-only advice — continues to `create_fit_card` |
 | `create_fit_card` | empty outfit string | returns fallback caption — never returns `None` |
 ---

@@ -42,6 +42,7 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        "retry_note": None,          # set if search was retried with looser constraints
     }
 
 
@@ -123,17 +124,44 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     }
 
     # ─────────────────────────────
-    # Step 3: search listings
+    # Step 3: search listings (with retry fallback)
     # ─────────────────────────────
     results = search_listings(description, size, max_price)
     session["search_results"] = results
 
-    # Branch: no results → stop pipeline
+    # Retry 1: drop size filter if it was set and produced no results
+    if not results and size is not None:
+        results = search_listings(description, None, max_price)
+        if results:
+            session["search_results"] = results
+            session["retry_note"] = (
+                f"No results for size {size} — showing results without size filter."
+            )
+            size = None
+
+    # Retry 2: drop price filter too if still no results
+    if not results and max_price is not None:
+        results = search_listings(description, None, None)
+        if results:
+            session["search_results"] = results
+            session["retry_note"] = (
+                f"No exact matches — removed size and price filters to find results."
+            )
+            size = None
+            max_price = None
+
+    # All retries exhausted → stop pipeline
     if not results:
+        tried_filters = []
+        if session["parsed"]["size"]:
+            tried_filters.append(f"size {session['parsed']['size']}")
+        if session["parsed"]["max_price"]:
+            tried_filters.append(f"under ${session['parsed']['max_price']}")
+        filter_str = " and ".join(tried_filters)
         session["error"] = (
-            "No matching items found for your query. "
-            "Try broadening your search — use fewer keywords, remove the size filter, "
-            "or raise your price ceiling."
+            f"No results found{' for ' + filter_str if filter_str else ''} — "
+            "even after removing size and price filters. "
+            "Try a different description."
         )
         return session
 

@@ -93,6 +93,10 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         f"Condition: {item.get('condition', 'unknown')}"
     )
 
+    # Prepend retry note if the agent loosened constraints to find this result
+    if session.get("retry_note"):
+        listing_text = f"Note: {session['retry_note']}\n\n{listing_text}"
+
     # ─────────────────────────────
     # Step 6: extract outputs
     # ─────────────────────────────

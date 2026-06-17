@@ -155,11 +155,15 @@ The agent in `run_agent()` follows a **fixed, conditional pipeline** — not a l
 **Step 1 — Parse the query (no LLM)**
 The agent extracts three parameters from the raw query using regex: `description`, `size`, and `max_price`. This is intentionally deterministic — regex is cheap, instant, and produces the same parse every time, which matters for reproducibility. An LLM parse would be slower, cost tokens, and could vary between calls. Extracted values are stored in `session["parsed"]`.
 
-**Step 2 — Search for listings**
+**Step 2 — Search for listings (with retry fallback)**
 The agent calls `search_listings` with the extracted parameters. After this call, the agent checks: _did we get any results?_
 
-- **If no results:** the agent sets `session["error"]` to a user-facing message and returns immediately. Tools 2 and 3 are never called. Continuing without a real item would produce hallucinated outfits, so the agent stops.
-- **If results exist:** the agent selects `results[0]` as the best match. Picking the top-scored item is a deliberate design choice — the scoring is already ranked, so index 0 is the most relevant result.
+- **If no results and size was specified:** the agent retries with `size=None`, dropping the size filter. If results are found, it stores a `retry_note` in the session and continues. Size is dropped first because it is the most restrictive filter in the dataset.
+- **If still no results and max_price was specified:** the agent retries again with both `size=None` and `max_price=None`. If results are found, it stores a `retry_note` and continues.
+- **If all retries fail:** the agent sets `session["error"]` naming which filters were tried and returns immediately. Tools 2 and 3 are never called.
+- **If results exist** (from the initial search or any retry): the agent selects `results[0]` as the best match. Picking the top-scored item is a deliberate design choice — the scoring is already ranked, so index 0 is the most relevant result.
+
+The `retry_note` is shown to the user in panel 1 (prepended to the listing text) so they always know when filters were loosened.
 
 **Step 3 — Generate an outfit**
 `suggest_outfit` is only called once the agent has a real `selected_item`. The agent passes both the item and the user's wardrobe. Internally, the tool itself makes a branch decision: empty wardrobe → general styling; non-empty wardrobe → outfit using named wardrobe pieces. Any exception here is caught and stored in `session["error"]`; the agent returns early rather than calling `create_fit_card` with no outfit.
@@ -189,6 +193,7 @@ All state for one interaction lives in a single `session` dict initialized by `_
     "outfit_suggestion": str,    # output of suggest_outfit
     "fit_card":          str,    # output of create_fit_card
     "error":             str,    # set on any early-exit; None on success
+    "retry_note":        str,    # set if a retry loosened constraints; None otherwise
 }
 ```
 
@@ -217,7 +222,9 @@ Each tool reads only from the session fields it needs and writes only one new fi
 | Tool / Step | Failure condition | What the agent does |
 |-------------|-------------------|---------------------|
 | `handle_query` | Empty or whitespace-only query string | Returns `("Please enter a search query.", "", "")` immediately — `run_agent` is never called |
-| `search_listings` | Returns `[]` (no matches) | Sets `session["error"] = "No matching items found for your query."` and returns session early. Tools 2 and 3 are skipped entirely. |
+| `search_listings` | Returns `[]` and size was specified | **Retry 1:** calls `search_listings(description, None, max_price)` without size filter. If results found, sets `session["retry_note"]` and continues. |
+| `search_listings` | Still `[]` and max_price was specified | **Retry 2:** calls `search_listings(description, None, None)` without size or price filter. If results found, sets `session["retry_note"]` and continues. |
+| `search_listings` | Still `[]` after all retries | Sets `session["error"]` naming which filters were tried. Returns session early — tools 2 and 3 are skipped entirely. |
 | `suggest_outfit` | Raises an exception (e.g. API timeout) | Sets `session["error"]` with the exception message, returns session early. `create_fit_card` is not called. |
 | `suggest_outfit` | `wardrobe["items"]` is empty | Handled internally: the tool switches to a general-styling prompt instead of raising or returning empty. The pipeline continues normally. |
 | `create_fit_card` | `outfit` is empty or whitespace-only | Handled internally: returns a fallback caption built from `new_item` fields alone — never returns `None`. |
@@ -239,9 +246,29 @@ session["error"] = (
 
 and returns. `suggest_outfit` and `create_fit_card` are never called. The Gradio UI shows the error message in panel 1 (with specific guidance on what to adjust) and leaves panels 2 and 3 empty.
 
+**Query that triggers a retry:** `"vintage graphic tee size XXS under $30"`
+
+`search_listings` finds no listings in size XXS under $30. The agent retries without the size filter: `search_listings("vintage graphic tee size XXS under $30", None, 30)` and finds results. `session["retry_note"]` is set to `"No results for size XXS — showing results without size filter."` The UI panel 1 shows the note above the listing so the user knows the filter was relaxed.
+
 **Query with empty wardrobe:** `"vintage graphic tee under $30"` with `Empty wardrobe (new user)` selected.
 
 `search_listings` finds results. `suggest_outfit` is called with `wardrobe = {"items": []}`. The tool detects the empty wardrobe and calls the LLM with a general-styling prompt instead of a wardrobe-matching prompt. Output: a paragraph about what kinds of bottoms and shoes pair well with graphic tees. `create_fit_card` runs normally and returns a caption. All three panels populate.
+
+---
+
+## Stretch Feature: Retry Logic with Fallback
+
+When `search_listings` returns no results, the agent automatically retries with progressively looser constraints rather than immediately failing. This keeps the agent useful for queries that are slightly too specific.
+
+**Retry sequence:**
+
+1. **Drop size filter** — if the user specified a size and got no results, retry without it. Size is dropped first because it is the most restrictive filter in the 40-item dataset.
+2. **Drop price filter** — if still no results and the user specified a price ceiling, retry with no filters at all (description-only search).
+3. **Fail gracefully** — if all retries fail, return an error message that names exactly which filters were tried, so the user knows to change their description.
+
+**Transparency:** Every retry that finds results sets `session["retry_note"]` with a plain-English explanation (e.g. `"No results for size XXS — showing results without size filter."`). This note is prepended to the listing panel in the UI so the user always knows when their search was automatically widened.
+
+**What doesn't change:** The original parsed values (`session["parsed"]["size"]`, `session["parsed"]["max_price"]`) are never overwritten — they preserve the user's intent. Only the local variables used for the retry calls are loosened.
 
 ---
 
