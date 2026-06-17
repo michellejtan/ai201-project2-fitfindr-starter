@@ -44,7 +44,69 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            session["fit_card"].
     """
     # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    """
+    Called by Gradio when the user submits a query.
+    """
+
+    # ─────────────────────────────
+    # Step 1: guard empty input
+    # ─────────────────────────────
+    if not user_query or not user_query.strip():
+        return (
+            "Please enter a search query.",
+            "",
+            ""
+        )
+
+    # ─────────────────────────────
+    # Step 2: select wardrobe
+    # ─────────────────────────────
+    if wardrobe_choice == "Example wardrobe":
+        wardrobe = get_example_wardrobe()
+    else:
+        wardrobe = get_empty_wardrobe()
+
+    # ─────────────────────────────
+    # Step 3: run agent
+    # ─────────────────────────────
+    session = run_agent(user_query, wardrobe)
+
+    # ─────────────────────────────
+    # Step 4: handle error state
+    # ─────────────────────────────
+    if session.get("error"):
+        return (
+            f"Error: {session['error']}",
+            "",
+            ""
+        )
+
+    # ─────────────────────────────
+    # Step 5: format listing output
+    # ─────────────────────────────
+    item = session.get("selected_item") or {}
+
+    listing_text = (
+        f"{item.get('title', 'Unknown item')}\n"
+        f"Price: ${item.get('price', '?')}\n"
+        f"Platform: {item.get('platform', 'unknown')}\n"
+        f"Condition: {item.get('condition', 'unknown')}"
+    )
+
+    # ─────────────────────────────
+    # Step 6: extract outputs
+    # ─────────────────────────────
+    outfit_text = session.get("outfit_suggestion") or ""
+    fit_card_text = session.get("fit_card") or ""
+
+    # ─────────────────────────────
+    # Step 7: return to UI
+    # ─────────────────────────────
+    return (
+        listing_text,
+        outfit_text,
+        fit_card_text
+    )
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
